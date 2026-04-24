@@ -11,6 +11,7 @@ using NinjaTrader.Gui.Chart;
 using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.DrawingTools;
+using NinjaTrader.NinjaScript.Indicators;
 #endregion
 
 namespace NinjaTrader.NinjaScript.Strategies
@@ -19,24 +20,37 @@ namespace NinjaTrader.NinjaScript.Strategies
 	{
 		#region Variables
 
-		// Etat de la journee ORB
+		// Etat journalier ORB
 		private DateTime	currentSessionDate;
 		private double		rangeHigh;
 		private double		rangeLow;
 		private bool		rangeLocked;
 		private bool		tradedToday;
-		private int			currentDirection;	// 1=long, -1=short, 0=flat
+		private string		rangeTagHigh;
+		private string		rangeTagLow;
+		private string		rangeTagBox;
+
+		// Entree / trailing
+		private double		entryPrice;
+		private double		trailStopPrice;
+		private int			lastTradeBar;
+
+		// VWAP session (calcul manuel)
+		private double		cumPriceVol;
+		private double		cumVol;
+		private double		sessionVwap;
 
 		// Indicateurs
-		private VOLMA		volMa;
+		private SMA			volMa;
 		private ATR			atr;
-		private VWAP8		vwap;
 
 		// Stats
 		private int			statBreakoutsLong;
 		private int			statBreakoutsShort;
 		private int			statVolumeRejected;
+		private int			statVwapRejected;
 		private int			statTimeStops;
+		private int			statDaysTraded;
 
 		#endregion
 
@@ -44,7 +58,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		{
 			if (State == State.SetDefaults)
 			{
-				Description					= "Opening Range Breakout 30min sur MES (RTH US). Entry sur breakout + filtre volume. Stop opposite side of range. Target 2x range ou trailing ATR. Flat a 15h45 NY.";
+				Description					= "Opening Range Breakout (ORB) sur MES — RTH US. Range 30min, entry breakout + filtres volume/VWAP, stop opposite side, target fixe OU trailing ATR, time stop 15h45 NY, 1 trade/jour. Chaque filtre toggleable.";
 				Name						= "MESORBStrategy";
 				Calculate					= Calculate.OnBarClose;
 				EntriesPerDirection			= 1;
@@ -55,36 +69,46 @@ namespace NinjaTrader.NinjaScript.Strategies
 				MaximumBarsLookBack			= MaximumBarsLookBack.Infinite;
 				StartBehavior				= StartBehavior.WaitUntilFlat;
 				IsInstantiatedOnEachOptimizationIteration = true;
+				DefaultQuantity				= 1;
 
-				// ORB params
+				// --- ORB ---
 				RangeMinutes				= 30;
-				SessionStartHour			= 9;
+				SessionStartHour			= 9;	// 9h30 NY (si chart en NY). Pour CT : 8h30.
 				SessionStartMinute			= 30;
+				EnableTimeStop				= true;
 				TimeStopHour				= 15;
 				TimeStopMinute				= 45;
+				EnableOneTradePerDay		= true;
 
-				// Volume filter
+				// --- Volume Filter ---
 				EnableVolumeFilter			= true;
 				VolumeMAPeriod				= 20;
 				VolumeMultiplier			= 1.3;
 
-				// Target / Stop
-				TargetMode					= 1;	// 1=fixe 2x range, 2=trailing ATR 3x
+				// --- VWAP Filter ---
+				EnableVWAPFilter			= false;
+
+				// --- Target (fixe) ---
+				EnableFixedTarget			= true;
 				TargetMultiplier			= 2.0;
+
+				// --- Stop opposite side ---
+				EnableRangeStop				= true;
+
+				// --- Trailing ATR ---
+				EnableATRTrail				= false;
 				ATRPeriod					= 14;
 				ATRTrailMultiplier			= 3.0;
 
-				// Filtre VWAP (optionnel V1)
-				EnableVWAPFilter			= false;
-
-				// Filtre jours
+				// --- Jours autorises ---
 				TradeLundi					= true;
 				TradeMardi					= true;
 				TradeMercredi				= true;
 				TradeJeudi					= true;
 				TradeVendredi				= true;
 
-				// Visuel
+				// --- Visuel ---
+				EnableDrawRange				= true;
 				RangeOpacity				= 25;
 			}
 			else if (State == State.Configure)
@@ -94,18 +118,26 @@ namespace NinjaTrader.NinjaScript.Strategies
 				rangeLow			= double.MaxValue;
 				rangeLocked			= false;
 				tradedToday			= false;
-				currentDirection	= 0;
+
+				entryPrice			= 0;
+				trailStopPrice		= 0;
+				lastTradeBar		= -1;
+
+				cumPriceVol			= 0;
+				cumVol				= 0;
+				sessionVwap			= 0;
 
 				statBreakoutsLong	= 0;
 				statBreakoutsShort	= 0;
 				statVolumeRejected	= 0;
+				statVwapRejected	= 0;
 				statTimeStops		= 0;
+				statDaysTraded		= 0;
 			}
 			else if (State == State.DataLoaded)
 			{
-				volMa	= VOLMA(VolumeMAPeriod);
+				volMa	= SMA(Volume, VolumeMAPeriod);
 				atr		= ATR(ATRPeriod);
-				vwap	= VWAP8();
 			}
 			else if (State == State.Terminated)
 			{
@@ -119,20 +151,160 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (CurrentBar < Math.Max(VolumeMAPeriod, ATRPeriod) + 5)
 				return;
 
-			// ====================================================================
-			// LOGIQUE ORB A CODER ICI (V1)
-			// ====================================================================
-			// 1. Detecter nouveau jour de trading -> reset range, tradedToday=false
-			// 2. Construire la range sur les 30 premieres minutes (9h30-10h00 NY)
-			// 3. Au close de 10h00 NY -> lock range (rangeLocked=true)
-			// 4. Apres lock, sur chaque close 5min :
-			//    - Si close > rangeHigh + volume OK -> EnterLong
-			//    - Si close < rangeLow + volume OK -> EnterShort
-			// 5. Gestion Stop (opposite side) et Target (2x range ou trailing ATR)
-			// 6. Time stop : flat a 15h45 NY
-			// 7. 1 trade max par jour (tradedToday=true apres entry)
-			// ====================================================================
+			// ----- 1. Detection nouveau jour -----
+			if (Time[0].Date != currentSessionDate)
+			{
+				currentSessionDate	= Time[0].Date;
+				rangeHigh			= double.MinValue;
+				rangeLow			= double.MaxValue;
+				rangeLocked			= false;
+				tradedToday			= false;
+				cumPriceVol			= 0;
+				cumVol				= 0;
+				sessionVwap			= 0;
+				trailStopPrice		= 0;
+
+				// Tags uniques pour dessin (evite chevauchement multi-jours)
+				string d = Time[0].ToString("yyyyMMdd");
+				rangeTagHigh	= "ORH_" + d;
+				rangeTagLow		= "ORL_" + d;
+				rangeTagBox		= "ORBOX_" + d;
+			}
+
+			// ----- 2. Calcul VWAP session (manuel, typical price * volume) -----
+			double typical	= (High[0] + Low[0] + Close[0]) / 3.0;
+			cumPriceVol	+= typical * Volume[0];
+			cumVol		+= Volume[0];
+			sessionVwap	= cumVol > 0 ? cumPriceVol / cumVol : Close[0];
+
+			int minSinceOpen = (Time[0].Hour - SessionStartHour) * 60 + (Time[0].Minute - SessionStartMinute);
+
+			// ----- 3. Construction de l'opening range -----
+			if (!rangeLocked)
+			{
+				if (minSinceOpen > 0 && minSinceOpen <= RangeMinutes)
+				{
+					if (High[0] > rangeHigh) rangeHigh = High[0];
+					if (Low[0] < rangeLow)   rangeLow  = Low[0];
+				}
+				if (minSinceOpen >= RangeMinutes && rangeHigh > double.MinValue)
+				{
+					rangeLocked = true;
+					if (EnableDrawRange)
+						DrawRange();
+				}
+				return;	// rien d'autre avant lock
+			}
+
+			// ----- 4. Gestion Time Stop -----
+			if (EnableTimeStop && IsPastTimeStop() && Position.MarketPosition != MarketPosition.Flat)
+			{
+				if (Position.MarketPosition == MarketPosition.Long)
+					ExitLong("TimeStop", "ORB Long");
+				else
+					ExitShort("TimeStop", "ORB Short");
+				statTimeStops++;
+				return;
+			}
+
+			// ----- 5. Trailing ATR (si actif et en position) -----
+			if (EnableATRTrail && Position.MarketPosition != MarketPosition.Flat)
+				UpdateTrailingStop();
+
+			// ----- 6. Tentative d'entry breakout -----
+			if (!tradedToday
+				&& Position.MarketPosition == MarketPosition.Flat
+				&& IsDayAllowed()
+				&& (!EnableTimeStop || !IsPastTimeStop())
+				&& CurrentBar != lastTradeBar)
+			{
+				TryBreakoutEntry();
+			}
 		}
+
+		#region ORB logic
+
+		private void TryBreakoutEntry()
+		{
+			bool breakoutLong  = Close[0] > rangeHigh;
+			bool breakoutShort = Close[0] < rangeLow;
+
+			if (!breakoutLong && !breakoutShort)
+				return;
+
+			// Volume filter
+			if (EnableVolumeFilter && !VolumeConfirms())
+			{
+				statVolumeRejected++;
+				return;
+			}
+
+			// VWAP filter
+			if (EnableVWAPFilter)
+			{
+				if (breakoutLong && Close[0] <= sessionVwap) { statVwapRejected++; return; }
+				if (breakoutShort && Close[0] >= sessionVwap) { statVwapRejected++; return; }
+			}
+
+			double rangeHeight = rangeHigh - rangeLow;
+			if (rangeHeight <= 0)
+				return;
+
+			if (breakoutLong)
+			{
+				if (EnableRangeStop)
+					SetStopLoss("ORB Long", CalculationMode.Price, rangeLow, false);
+				if (EnableFixedTarget)
+					SetProfitTarget("ORB Long", CalculationMode.Price, Close[0] + rangeHeight * TargetMultiplier);
+
+				EnterLong(DefaultQuantity, "ORB Long");
+				entryPrice		= Close[0];
+				trailStopPrice	= rangeLow;
+				statBreakoutsLong++;
+				if (EnableOneTradePerDay) { tradedToday = true; statDaysTraded++; }
+				lastTradeBar = CurrentBar;
+			}
+			else if (breakoutShort)
+			{
+				if (EnableRangeStop)
+					SetStopLoss("ORB Short", CalculationMode.Price, rangeHigh, false);
+				if (EnableFixedTarget)
+					SetProfitTarget("ORB Short", CalculationMode.Price, Close[0] - rangeHeight * TargetMultiplier);
+
+				EnterShort(DefaultQuantity, "ORB Short");
+				entryPrice		= Close[0];
+				trailStopPrice	= rangeHigh;
+				statBreakoutsShort++;
+				if (EnableOneTradePerDay) { tradedToday = true; statDaysTraded++; }
+				lastTradeBar = CurrentBar;
+			}
+		}
+
+		private void UpdateTrailingStop()
+		{
+			double atrVal = atr[0] * ATRTrailMultiplier;
+
+			if (Position.MarketPosition == MarketPosition.Long)
+			{
+				double candidate = Close[0] - atrVal;
+				if (candidate > trailStopPrice)
+				{
+					trailStopPrice = candidate;
+					SetStopLoss("ORB Long", CalculationMode.Price, trailStopPrice, false);
+				}
+			}
+			else if (Position.MarketPosition == MarketPosition.Short)
+			{
+				double candidate = Close[0] + atrVal;
+				if (candidate < trailStopPrice || trailStopPrice == 0)
+				{
+					trailStopPrice = candidate;
+					SetStopLoss("ORB Short", CalculationMode.Price, trailStopPrice, false);
+				}
+			}
+		}
+
+		#endregion
 
 		#region Helpers
 
@@ -149,21 +321,35 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 		}
 
-		private bool IsInOpeningRangeWindow()
-		{
-			int minutesSinceStart = (Time[0].Hour - SessionStartHour) * 60 + (Time[0].Minute - SessionStartMinute);
-			return minutesSinceStart >= 0 && minutesSinceStart < RangeMinutes;
-		}
-
 		private bool IsPastTimeStop()
 		{
-			return Time[0].Hour > TimeStopHour || (Time[0].Hour == TimeStopHour && Time[0].Minute >= TimeStopMinute);
+			return Time[0].Hour > TimeStopHour
+				|| (Time[0].Hour == TimeStopHour && Time[0].Minute >= TimeStopMinute);
 		}
 
 		private bool VolumeConfirms()
 		{
-			if (!EnableVolumeFilter) return true;
 			return Volume[0] > volMa[0] * VolumeMultiplier;
+		}
+
+		private void DrawRange()
+		{
+			// Ligne HIGH
+			Draw.HorizontalLine(this, rangeTagHigh, rangeHigh, Brushes.LimeGreen);
+			// Ligne LOW
+			Draw.HorizontalLine(this, rangeTagLow, rangeLow, Brushes.OrangeRed);
+			// Rectangle range
+			Brush fill = new SolidColorBrush(Color.FromArgb((byte)(RangeOpacity * 2.55), 100, 149, 237));
+			fill.Freeze();
+			Draw.Rectangle(this, rangeTagBox,
+				false,
+				CurrentBar - (int)(RangeMinutes / Math.Max(1, BarsPeriod.Value)),
+				rangeLow,
+				0,
+				rangeHigh,
+				Brushes.CornflowerBlue,
+				fill,
+				RangeOpacity);
 		}
 
 		#endregion
@@ -196,12 +382,24 @@ namespace NinjaTrader.NinjaScript.Strategies
 			Log("       MES ORB - STATS FINALES          ");
 			Log("========================================");
 			Log("");
+			Log("--- PARAMETRES ACTIFS ---");
+			Log("RangeMinutes       : " + RangeMinutes);
+			Log("VolumeFilter       : " + (EnableVolumeFilter ? "ON (x" + VolumeMultiplier.ToString("F2") + ")" : "OFF"));
+			Log("VWAPFilter         : " + (EnableVWAPFilter ? "ON" : "OFF"));
+			Log("FixedTarget        : " + (EnableFixedTarget ? "ON (" + TargetMultiplier.ToString("F1") + "x range)" : "OFF"));
+			Log("RangeStop          : " + (EnableRangeStop ? "ON" : "OFF"));
+			Log("ATRTrail           : " + (EnableATRTrail ? "ON (" + ATRTrailMultiplier.ToString("F1") + "x ATR" + ATRPeriod + ")" : "OFF"));
+			Log("TimeStop           : " + (EnableTimeStop ? "ON (" + TimeStopHour + "h" + TimeStopMinute.ToString("D2") + ")" : "OFF"));
+			Log("OneTradePerDay     : " + (EnableOneTradePerDay ? "ON" : "OFF"));
+			Log("");
 			Log("--- COMPTEURS ---");
 			Log("Total trades       : " + totalCount);
 			Log("Breakouts Long     : " + statBreakoutsLong);
 			Log("Breakouts Short    : " + statBreakoutsShort);
 			Log("Rejets volume      : " + statVolumeRejected);
+			Log("Rejets VWAP        : " + statVwapRejected);
 			Log("Time stops         : " + statTimeStops);
+			Log("Jours traded       : " + statDaysTraded);
 			Log("");
 			Log("--- LONG ---");
 			Log("Trades Long        : " + longCount);
@@ -225,14 +423,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 			Log("Profit Factor      : " + (totalLosses > 0 && avgLoss != 0 ? (all.WinningTrades.TradesPerformance.Currency.CumProfit / Math.Abs(all.LosingTrades.TradesPerformance.Currency.CumProfit)).ToString("F2") : "N/A"));
 
 			// Drawdown
-			double maxDD = 0;
-			double peak = 0;
-			double cumPnL = 0;
+			double maxDD = 0, peak = 0, cumPnL = 0;
 			DateTime ddStart = DateTime.MinValue, ddEnd = DateTime.MinValue;
 			DateTime currentDDStart = DateTime.MinValue;
 			int maxUnderwaterDays = 0;
 			DateTime uwStart = DateTime.MinValue;
-
 			for (int t = 0; t < all.Count; t++)
 			{
 				cumPnL += all[t].ProfitCurrency;
@@ -243,7 +438,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 					if (uwStart != DateTime.MinValue)
 					{
 						int uwDays = (int)(all[t].Exit.Time - uwStart).TotalDays;
-						if (uwDays > maxUnderwaterDays) { maxUnderwaterDays = uwDays; }
+						if (uwDays > maxUnderwaterDays) maxUnderwaterDays = uwDays;
 					}
 					uwStart = DateTime.MinValue;
 				}
@@ -251,12 +446,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				{
 					if (uwStart == DateTime.MinValue) uwStart = all[t].Exit.Time;
 					double dd = peak - cumPnL;
-					if (dd > maxDD)
-					{
-						maxDD = dd;
-						ddStart = currentDDStart;
-						ddEnd = all[t].Exit.Time;
-					}
+					if (dd > maxDD) { maxDD = dd; ddStart = currentDDStart; ddEnd = all[t].Exit.Time; }
 				}
 			}
 			if (uwStart != DateTime.MinValue && all.Count > 0)
@@ -272,7 +462,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (ddStart != DateTime.MinValue)
 				Log("  Periode          : " + ddStart.ToString("dd/MM/yyyy") + " -> " + ddEnd.ToString("dd/MM/yyyy"));
 
-			// Mois perdants consecutifs
+			// Mois perdants consecutifs + PnL mensuel
 			var monthlyPnL = new SortedDictionary<string, double>();
 			for (int t = 0; t < all.Count; t++)
 			{
@@ -280,7 +470,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 				if (!monthlyPnL.ContainsKey(key)) monthlyPnL[key] = 0;
 				monthlyPnL[key] += all[t].ProfitCurrency;
 			}
-
 			int maxConsecLoss = 0, curConsecLoss = 0;
 			string consecStart = "", consecEnd = "", curStart = "";
 			foreach (var kv in monthlyPnL)
@@ -296,14 +485,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 						consecEnd = kv.Key;
 					}
 				}
-				else
-					curConsecLoss = 0;
+				else curConsecLoss = 0;
 			}
 			Log("Mois perdants consec: " + maxConsecLoss + " mois");
 			if (maxConsecLoss > 0)
 				Log("  Periode          : " + consecStart + " -> " + consecEnd);
 
-			// PnL mensuel
 			Log("");
 			Log("--- PNL MENSUEL ---");
 			foreach (var kv in monthlyPnL)
@@ -312,7 +499,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				Log("  " + kv.Key + " : " + kv.Value.ToString("F2") + " $" + marker);
 			}
 
-			// PnL hebdomadaire
+			// PnL hebdo
 			var weeklyPnL = new SortedDictionary<string, double>();
 			var cal = System.Globalization.CultureInfo.InvariantCulture.Calendar;
 			for (int t = 0; t < all.Count; t++)
@@ -323,7 +510,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 				if (!weeklyPnL.ContainsKey(key)) weeklyPnL[key] = 0;
 				weeklyPnL[key] += all[t].ProfitCurrency;
 			}
-
 			Log("");
 			Log("--- PNL HEBDO ---");
 			foreach (var kv in weeklyPnL)
@@ -334,7 +520,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			Log("========================================");
 
-			// Auto-export vers UserDataDir (partage Parallels Mac/Windows)
 			Print("[LOG] UserDataDir = " + NinjaTrader.Core.Globals.UserDataDir);
 			try
 			{
@@ -352,16 +537,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		#region Properties
 
-		// --- Groupe 1 : Opening Range ---
+		// ===== Groupe 1 : Opening Range =====
 		[NinjaScriptProperty]
-		[Range(5, 120)]
-		[Display(Name = "Range Minutes", Description = "Duree de l'opening range en minutes (defaut: 30)",
+		[Range(5, 240)]
+		[Display(Name = "Range Minutes", Description = "Duree de l'opening range (defaut: 30 min)",
 			Order = 1, GroupName = "1. Opening Range")]
 		public int RangeMinutes { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, 23)]
-		[Display(Name = "Session Start Hour", Description = "Heure debut RTH (defaut: 9 = 9h30 NY)",
+		[Display(Name = "Session Start Hour", Description = "Heure debut RTH (9 si chart NY, 8 si chart CT)",
 			Order = 2, GroupName = "1. Opening Range")]
 		public int SessionStartHour { get; set; }
 
@@ -371,93 +556,121 @@ namespace NinjaTrader.NinjaScript.Strategies
 			Order = 3, GroupName = "1. Opening Range")]
 		public int SessionStartMinute { get; set; }
 
+		// ===== Groupe 2 : Time Stop =====
+		[NinjaScriptProperty]
+		[Display(Name = "Enable Time Stop", Description = "Flatter toutes positions a une heure donnee (defaut: ON)",
+			Order = 1, GroupName = "2. Time Stop")]
+		public bool EnableTimeStop { get; set; }
+
 		[NinjaScriptProperty]
 		[Range(0, 23)]
-		[Display(Name = "Time Stop Hour", Description = "Heure flat forcee (defaut: 15 = 15h45 NY)",
-			Order = 4, GroupName = "1. Opening Range")]
+		[Display(Name = "Time Stop Hour", Description = "Heure du flat forcee (15 = 15h45 NY)",
+			Order = 2, GroupName = "2. Time Stop")]
 		public int TimeStopHour { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, 59)]
-		[Display(Name = "Time Stop Minute", Description = "Minute flat forcee (defaut: 45)",
-			Order = 5, GroupName = "1. Opening Range")]
+		[Display(Name = "Time Stop Minute", Description = "Minute du flat forcee (defaut: 45)",
+			Order = 3, GroupName = "2. Time Stop")]
 		public int TimeStopMinute { get; set; }
 
-		// --- Groupe 2 : Volume Filter ---
+		// ===== Groupe 3 : Re-Entry =====
 		[NinjaScriptProperty]
-		[Display(Name = "Enable Volume Filter", Description = "Active le filtre de confirmation volume (defaut: true)",
-			Order = 1, GroupName = "2. Volume Filter")]
+		[Display(Name = "Enable One Trade Per Day", Description = "Bloque les re-entries apres 1er trade (defaut: ON)",
+			Order = 1, GroupName = "3. Re-Entry")]
+		public bool EnableOneTradePerDay { get; set; }
+
+		// ===== Groupe 4 : Volume Filter =====
+		[NinjaScriptProperty]
+		[Display(Name = "Enable Volume Filter", Description = "Breakout valide seulement si volume > MA x multiplier (defaut: ON)",
+			Order = 1, GroupName = "4. Volume Filter")]
 		public bool EnableVolumeFilter { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, 200)]
-		[Display(Name = "Volume MA Period", Description = "Periode MA du volume (defaut: 20)",
-			Order = 2, GroupName = "2. Volume Filter")]
+		[Display(Name = "Volume MA Period", Description = "Periode de la moyenne mobile du volume (defaut: 20)",
+			Order = 2, GroupName = "4. Volume Filter")]
 		public int VolumeMAPeriod { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0.1, 10.0)]
-		[Display(Name = "Volume Multiplier", Description = "Multiplicateur VolMA pour valider breakout (defaut: 1.3)",
-			Order = 3, GroupName = "2. Volume Filter")]
+		[Display(Name = "Volume Multiplier", Description = "Multiplicateur VolMA pour valider (defaut: 1.3)",
+			Order = 3, GroupName = "4. Volume Filter")]
 		public double VolumeMultiplier { get; set; }
 
-		// --- Groupe 3 : Target / Stop ---
+		// ===== Groupe 5 : VWAP Filter =====
 		[NinjaScriptProperty]
-		[Range(1, 2)]
-		[Display(Name = "Target Mode", Description = "1 = target fixe (X * range), 2 = trailing ATR",
-			Order = 1, GroupName = "3. Target Stop")]
-		public int TargetMode { get; set; }
+		[Display(Name = "Enable VWAP Filter", Description = "Long only si close > VWAP, short only si close < VWAP (defaut: OFF)",
+			Order = 1, GroupName = "5. VWAP Filter")]
+		public bool EnableVWAPFilter { get; set; }
+
+		// ===== Groupe 6 : Target fixe =====
+		[NinjaScriptProperty]
+		[Display(Name = "Enable Fixed Target", Description = "Take profit a X fois la hauteur du range (defaut: ON)",
+			Order = 1, GroupName = "6. Fixed Target")]
+		public bool EnableFixedTarget { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0.5, 10.0)]
-		[Display(Name = "Target Multiplier", Description = "Multiplicateur de la hauteur de range pour TP fixe (defaut: 2.0)",
-			Order = 2, GroupName = "3. Target Stop")]
+		[Display(Name = "Target Multiplier", Description = "Multiplicateur du range pour TP (defaut: 2.0)",
+			Order = 2, GroupName = "6. Fixed Target")]
 		public double TargetMultiplier { get; set; }
+
+		// ===== Groupe 7 : Range Stop =====
+		[NinjaScriptProperty]
+		[Display(Name = "Enable Range Stop", Description = "Stop loss sur cote oppose du range (defaut: ON)",
+			Order = 1, GroupName = "7. Range Stop")]
+		public bool EnableRangeStop { get; set; }
+
+		// ===== Groupe 8 : ATR Trailing Stop =====
+		[NinjaScriptProperty]
+		[Display(Name = "Enable ATR Trail", Description = "Trailing stop base sur ATR (defaut: OFF). Cumulable avec RangeStop — prend le plus proche.",
+			Order = 1, GroupName = "8. ATR Trailing Stop")]
+		public bool EnableATRTrail { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, 100)]
-		[Display(Name = "ATR Period", Description = "Periode ATR pour trailing stop (defaut: 14)",
-			Order = 3, GroupName = "3. Target Stop")]
+		[Display(Name = "ATR Period", Description = "Periode ATR (defaut: 14)",
+			Order = 2, GroupName = "8. ATR Trailing Stop")]
 		public int ATRPeriod { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0.5, 10.0)]
-		[Display(Name = "ATR Trail Multiplier", Description = "Multiplicateur ATR pour trailing stop (defaut: 3.0)",
-			Order = 4, GroupName = "3. Target Stop")]
+		[Display(Name = "ATR Trail Multiplier", Description = "Multiplicateur ATR pour trailing (defaut: 3.0)",
+			Order = 3, GroupName = "8. ATR Trailing Stop")]
 		public double ATRTrailMultiplier { get; set; }
 
-		// --- Groupe 4 : Filtres optionnels ---
+		// ===== Groupe 9 : Jours autorises =====
 		[NinjaScriptProperty]
-		[Display(Name = "Enable VWAP Filter", Description = "Long only si > VWAP, short only si < VWAP (defaut: false)",
-			Order = 1, GroupName = "4. Filtres optionnels")]
-		public bool EnableVWAPFilter { get; set; }
-
-		// --- Groupe 5 : Filtre Jours ---
-		[NinjaScriptProperty]
-		[Display(Name = "Lundi", Order = 1, GroupName = "5. Jours autorises")]
+		[Display(Name = "Lundi", Order = 1, GroupName = "9. Jours autorises")]
 		public bool TradeLundi { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Mardi", Order = 2, GroupName = "5. Jours autorises")]
+		[Display(Name = "Mardi", Order = 2, GroupName = "9. Jours autorises")]
 		public bool TradeMardi { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Mercredi", Order = 3, GroupName = "5. Jours autorises")]
+		[Display(Name = "Mercredi", Order = 3, GroupName = "9. Jours autorises")]
 		public bool TradeMercredi { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Jeudi", Order = 4, GroupName = "5. Jours autorises")]
+		[Display(Name = "Jeudi", Order = 4, GroupName = "9. Jours autorises")]
 		public bool TradeJeudi { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Vendredi", Order = 5, GroupName = "5. Jours autorises")]
+		[Display(Name = "Vendredi", Order = 5, GroupName = "9. Jours autorises")]
 		public bool TradeVendredi { get; set; }
 
-		// --- Groupe 6 : Visuel ---
+		// ===== Groupe 10 : Visuel =====
+		[NinjaScriptProperty]
+		[Display(Name = "Enable Draw Range", Description = "Dessine le rectangle de l'opening range sur le chart (defaut: ON)",
+			Order = 1, GroupName = "10. Visuel")]
+		public bool EnableDrawRange { get; set; }
+
 		[NinjaScriptProperty]
 		[Range(0, 100)]
-		[Display(Name = "Range Opacity", Description = "Opacite du rectangle de range (0-100)",
-			Order = 1, GroupName = "6. Visuel")]
+		[Display(Name = "Range Opacity", Description = "Opacite du rectangle (0-100)",
+			Order = 2, GroupName = "10. Visuel")]
 		public int RangeOpacity { get; set; }
 
 		#endregion
