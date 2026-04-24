@@ -334,22 +334,22 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		private void DrawRange()
 		{
-			// Ligne HIGH
+			// Lignes HIGH et LOW du range (version simple et robuste)
 			Draw.HorizontalLine(this, rangeTagHigh, rangeHigh, Brushes.LimeGreen);
-			// Ligne LOW
-			Draw.HorizontalLine(this, rangeTagLow, rangeLow, Brushes.OrangeRed);
-			// Rectangle range
-			Brush fill = new SolidColorBrush(Color.FromArgb((byte)(RangeOpacity * 2.55), 100, 149, 237));
-			fill.Freeze();
-			Draw.Rectangle(this, rangeTagBox,
-				false,
-				CurrentBar - (int)(RangeMinutes / Math.Max(1, BarsPeriod.Value)),
-				rangeLow,
-				0,
-				rangeHigh,
-				Brushes.CornflowerBlue,
-				fill,
-				RangeOpacity);
+			Draw.HorizontalLine(this, rangeTagLow,  rangeLow,  Brushes.OrangeRed);
+
+			// Rectangle optionnel (si la signature Draw.Rectangle plante, commenter ce bloc)
+			int barsAgo = 0;
+			if (BarsPeriod.BarsPeriodType == BarsPeriodType.Minute && BarsPeriod.Value > 0)
+				barsAgo = Math.Max(1, RangeMinutes / BarsPeriod.Value);
+			try
+			{
+				Draw.Rectangle(this, rangeTagBox, false,
+					barsAgo, rangeLow,
+					0, rangeHigh,
+					Brushes.CornflowerBlue, Brushes.CornflowerBlue, RangeOpacity);
+			}
+			catch { /* ignore si signature Draw.Rectangle indisponible */ }
 		}
 
 		#endregion
