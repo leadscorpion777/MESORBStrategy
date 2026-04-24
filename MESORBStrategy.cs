@@ -21,7 +21,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 		#region Variables
 
 		// Etat journalier ORB
-		private DateTime	currentSessionDate;
+		private DateTime	sessionStartTime;	// timestamp du 1er bar de la session en cours
+		private bool		sessionInitialized;
 		private double		rangeHigh;
 		private double		rangeLow;
 		private bool		rangeLocked;
@@ -73,12 +74,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 				// --- ORB ---
 				RangeMinutes				= 30;
-				SessionStartHour			= 9;	// 9h30 NY (si chart en NY). Pour CT : 8h30.
-				SessionStartMinute			= 30;
 				EnableTimeStop				= true;
-				TimeStopHour				= 15;
-				TimeStopMinute				= 45;
+				TimeStopMinutesAfterOpen	= 375;	// 6h15 apres open = 15h45 NY sur RTH 9h30
 				EnableOneTradePerDay		= true;
+				EnableDebugPrint			= true;	// Print info sur les 1eres barres de chaque session
 
 				// --- Volume Filter ---
 				EnableVolumeFilter			= true;
@@ -113,7 +112,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 			else if (State == State.Configure)
 			{
-				currentSessionDate	= DateTime.MinValue;
+				sessionStartTime	= DateTime.MinValue;
+				sessionInitialized	= false;
 				rangeHigh			= double.MinValue;
 				rangeLow			= double.MaxValue;
 				rangeLocked			= false;
@@ -151,10 +151,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (CurrentBar < Math.Max(VolumeMAPeriod, ATRPeriod) + 5)
 				return;
 
-			// ----- 1. Detection nouveau jour -----
-			if (Time[0].Date != currentSessionDate)
+			// ----- 1. Detection nouvelle session via IsFirstBarOfSession (fuseau-agnostique) -----
+			if (Bars.IsFirstBarOfSession)
 			{
-				currentSessionDate	= Time[0].Date;
+				sessionStartTime	= Time[0];
+				sessionInitialized	= true;
 				rangeHigh			= double.MinValue;
 				rangeLow			= double.MaxValue;
 				rangeLocked			= false;
@@ -164,40 +165,49 @@ namespace NinjaTrader.NinjaScript.Strategies
 				sessionVwap			= 0;
 				trailStopPrice		= 0;
 
-				// Tags uniques pour dessin (evite chevauchement multi-jours)
 				string d = Time[0].ToString("yyyyMMdd");
 				rangeTagHigh	= "ORH_" + d;
 				rangeTagLow		= "ORL_" + d;
 				rangeTagBox		= "ORBOX_" + d;
+
+				if (EnableDebugPrint)
+					Print("[SESSION] Start @ " + Time[0].ToString("yyyy-MM-dd HH:mm"));
 			}
 
-			// ----- 2. Calcul VWAP session (manuel, typical price * volume) -----
+			if (!sessionInitialized)
+				return;
+
+			// ----- 2. VWAP session (manuel) -----
 			double typical	= (High[0] + Low[0] + Close[0]) / 3.0;
 			cumPriceVol	+= typical * Volume[0];
 			cumVol		+= Volume[0];
 			sessionVwap	= cumVol > 0 ? cumPriceVol / cumVol : Close[0];
 
-			int minSinceOpen = (Time[0].Hour - SessionStartHour) * 60 + (Time[0].Minute - SessionStartMinute);
+			int minSinceOpen = (int)Math.Round((Time[0] - sessionStartTime).TotalMinutes);
 
-			// ----- 3. Construction de l'opening range -----
+			// ----- 3. Construction opening range -----
 			if (!rangeLocked)
 			{
-				if (minSinceOpen > 0 && minSinceOpen <= RangeMinutes)
+				// La 1ere barre de session est incluse (minSinceOpen >= 0)
+				if (minSinceOpen >= 0 && minSinceOpen < RangeMinutes + BarsPeriod.Value)
 				{
 					if (High[0] > rangeHigh) rangeHigh = High[0];
 					if (Low[0] < rangeLow)   rangeLow  = Low[0];
 				}
-				if (minSinceOpen >= RangeMinutes && rangeHigh > double.MinValue)
+				if (minSinceOpen + BarsPeriod.Value > RangeMinutes && rangeHigh > double.MinValue && rangeLow < double.MaxValue)
 				{
 					rangeLocked = true;
+					if (EnableDebugPrint)
+						Print("[RANGE LOCKED] @ " + Time[0].ToString("HH:mm") + " H=" + rangeHigh.ToString("F2") + " L=" + rangeLow.ToString("F2") + " (" + (rangeHigh - rangeLow).ToString("F2") + " pts)");
 					if (EnableDrawRange)
 						DrawRange();
 				}
-				return;	// rien d'autre avant lock
+				return;
 			}
 
-			// ----- 4. Gestion Time Stop -----
-			if (EnableTimeStop && IsPastTimeStop() && Position.MarketPosition != MarketPosition.Flat)
+			// ----- 4. Time Stop -----
+			bool pastTimeStop = EnableTimeStop && minSinceOpen >= TimeStopMinutesAfterOpen;
+			if (pastTimeStop && Position.MarketPosition != MarketPosition.Flat)
 			{
 				if (Position.MarketPosition == MarketPosition.Long)
 					ExitLong("TimeStop", "ORB Long");
@@ -207,15 +217,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return;
 			}
 
-			// ----- 5. Trailing ATR (si actif et en position) -----
+			// ----- 5. Trailing ATR -----
 			if (EnableATRTrail && Position.MarketPosition != MarketPosition.Flat)
 				UpdateTrailingStop();
 
-			// ----- 6. Tentative d'entry breakout -----
+			// ----- 6. Breakout entry -----
 			if (!tradedToday
 				&& Position.MarketPosition == MarketPosition.Flat
 				&& IsDayAllowed()
-				&& (!EnableTimeStop || !IsPastTimeStop())
+				&& !pastTimeStop
 				&& CurrentBar != lastTradeBar)
 			{
 				TryBreakoutEntry();
@@ -321,12 +331,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 		}
 
-		private bool IsPastTimeStop()
-		{
-			return Time[0].Hour > TimeStopHour
-				|| (Time[0].Hour == TimeStopHour && Time[0].Minute >= TimeStopMinute);
-		}
-
 		private bool VolumeConfirms()
 		{
 			return Volume[0] > volMa[0] * VolumeMultiplier;
@@ -389,7 +393,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			Log("FixedTarget        : " + (EnableFixedTarget ? "ON (" + TargetMultiplier.ToString("F1") + "x range)" : "OFF"));
 			Log("RangeStop          : " + (EnableRangeStop ? "ON" : "OFF"));
 			Log("ATRTrail           : " + (EnableATRTrail ? "ON (" + ATRTrailMultiplier.ToString("F1") + "x ATR" + ATRPeriod + ")" : "OFF"));
-			Log("TimeStop           : " + (EnableTimeStop ? "ON (" + TimeStopHour + "h" + TimeStopMinute.ToString("D2") + ")" : "OFF"));
+			Log("TimeStop           : " + (EnableTimeStop ? "ON (" + TimeStopMinutesAfterOpen + " min apres open)" : "OFF"));
 			Log("OneTradePerDay     : " + (EnableOneTradePerDay ? "ON" : "OFF"));
 			Log("");
 			Log("--- COMPTEURS ---");
@@ -540,39 +544,26 @@ namespace NinjaTrader.NinjaScript.Strategies
 		// ===== Groupe 1 : Opening Range =====
 		[NinjaScriptProperty]
 		[Range(5, 240)]
-		[Display(Name = "Range Minutes", Description = "Duree de l'opening range (defaut: 30 min)",
+		[Display(Name = "Range Minutes", Description = "Duree de l'opening range (defaut: 30 min). Base sur IsFirstBarOfSession — aucun pb de fuseau horaire.",
 			Order = 1, GroupName = "1. Opening Range")]
 		public int RangeMinutes { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(0, 23)]
-		[Display(Name = "Session Start Hour", Description = "Heure debut RTH (9 si chart NY, 8 si chart CT)",
+		[Display(Name = "Debug Print", Description = "Imprime debut de session + lock range (pour verifier que les sessions sont bien detectees)",
 			Order = 2, GroupName = "1. Opening Range")]
-		public int SessionStartHour { get; set; }
-
-		[NinjaScriptProperty]
-		[Range(0, 59)]
-		[Display(Name = "Session Start Minute", Description = "Minute debut RTH (defaut: 30)",
-			Order = 3, GroupName = "1. Opening Range")]
-		public int SessionStartMinute { get; set; }
+		public bool EnableDebugPrint { get; set; }
 
 		// ===== Groupe 2 : Time Stop =====
 		[NinjaScriptProperty]
-		[Display(Name = "Enable Time Stop", Description = "Flatter toutes positions a une heure donnee (defaut: ON)",
+		[Display(Name = "Enable Time Stop", Description = "Flatter toutes positions N minutes apres l'open (defaut: ON)",
 			Order = 1, GroupName = "2. Time Stop")]
 		public bool EnableTimeStop { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(0, 23)]
-		[Display(Name = "Time Stop Hour", Description = "Heure du flat forcee (15 = 15h45 NY)",
+		[Range(30, 1000)]
+		[Display(Name = "Time Stop Minutes After Open", Description = "Minutes apres debut session pour flat forcee (375 = 6h15 apres = 15h45 NY si open 9h30)",
 			Order = 2, GroupName = "2. Time Stop")]
-		public int TimeStopHour { get; set; }
-
-		[NinjaScriptProperty]
-		[Range(0, 59)]
-		[Display(Name = "Time Stop Minute", Description = "Minute du flat forcee (defaut: 45)",
-			Order = 3, GroupName = "2. Time Stop")]
-		public int TimeStopMinute { get; set; }
+		public int TimeStopMinutesAfterOpen { get; set; }
 
 		// ===== Groupe 3 : Re-Entry =====
 		[NinjaScriptProperty]
